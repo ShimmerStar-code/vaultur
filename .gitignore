@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.wrangler/
+.env
+.env.*
+!.env.example
+*.local
+.DS_Store
+coverage/
+test-results/
+public/web-vault/
+wrangler.deploy.jsonc

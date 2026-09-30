@@ -1,0 +1,258 @@
+import { SELF } from "cloudflare:test"
+import { describe, expect, it } from "vitest"
+
+import { api, registerAndLogin, TEST_USER, login, registerUser } from "./helpers"
+
+describe("identity", () => {
+	it("GET /api/config returns server metadata", async () => {
+		const res = await SELF.fetch("https://vault.test/api/config")
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as Record<string, any>
+		expect(body.object).toBe("config")
+		expect(body.server.name).toBe("Vaultur")
+		expect(body.environment.api).toBe("https://vault.test/api")
+	})
+
+	it("prelogin returns defaults for unknown user", async () => {
+		const res = await SELF.fetch("https://vault.test/identity/accounts/prelogin", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ email: "nobody@vaultur.dev" })
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({
+			kdf: 0,
+			kdfIterations: 600_000,
+			kdfMemory: null,
+			kdfParallelism: null
+		})
+	})
+
+	it("registers a new user and logs in", async () => {
+		const reg = await registerUser()
+		expect(reg.status).toBe(200)
+		expect(await reg.json()).toEqual({ object: "register", captchaBypassToken: "" })
+
+		// prelogin now returns the user's KDF settings
+		const pre = await SELF.fetch("https://vault.test/identity/accounts/prelogin", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ email: TEST_USER.email })
+		})
+		const preBody = (await pre.json()) as Record<string, unknown>
+		expect(preBody.kdfIterations).toBe(600_000)
+
+		const res = await login()
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as Record<string, any>
+		expect(body.token_type).toBe("Bearer")
+		expect(body.access_token).toBeTruthy()
+		expect(body.refresh_token).toBeTruthy()
+		expect(body.Key).toBe(TEST_USER.key)
+		expect(body.PrivateKey).toBe(TEST_USER.keys.encryptedPrivateKey)
+		expect(body.Kdf).toBe(0)
+		expect(body.KdfIterations).toBe(600_000)
+		expect(body.UserDecryptionOptions.HasMasterPassword).toBe(true)
+		expect(body.UserDecryptionOptions.MasterPasswordUnlock.Salt).toBe(TEST_USER.email)
+	})
+
+	it("personal API key (client_credentials) login includes decryption options", async () => {
+		const { access_token: token } = await registerAndLogin()
+		const profile = (await (await api(token, "GET", "/api/accounts/profile")).json()) as Record<
+			string,
+			any
+		>
+
+		const keyRes = await api(token, "POST", "/api/accounts/api-key", {
+			masterPasswordHash: TEST_USER.masterPasswordHash
+		})
+		expect(keyRes.status).toBe(200)
+		const { apiKey } = (await keyRes.json()) as { apiKey: string }
+
+		const form = new URLSearchParams({
+			grant_type: "client_credentials",
+			scope: "api",
+			client_id: `user.${profile.id}`,
+			client_secret: apiKey,
+			deviceType: "9",
+			deviceIdentifier: "cli-device",
+			deviceName: "cli"
+		})
+		const res = await SELF.fetch("https://vault.test/identity/connect/token", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: form.toString()
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as Record<string, any>
+		expect(body.access_token).toBeTruthy()
+		expect(body.Key).toBe(TEST_USER.key)
+		expect(body.AccountKeys.publicKeyEncryptionKeyPair.wrappedPrivateKey).toBe(
+			TEST_USER.keys.encryptedPrivateKey
+		)
+		expect(body.UserDecryptionOptions.HasMasterPassword).toBe(true)
+		expect(body.UserDecryptionOptions.MasterPasswordUnlock.Salt).toBe(TEST_USER.email)
+	})
+
+	it("rejects duplicate registration", async () => {
+		await registerUser()
+		const res = await registerUser()
+		expect(res.status).toBe(400)
+		const body = (await res.json()) as Record<string, any>
+		expect(body.errorModel.message).toContain("Registration not allowed")
+	})
+
+	it("rejects login with the wrong password", async () => {
+		await registerUser()
+		const res = await login(TEST_USER.email, "wrong-hash")
+		expect(res.status).toBe(400)
+		const body = (await res.json()) as Record<string, any>
+		expect(body.errorModel.message).toContain("Username or password is incorrect")
+	})
+
+	it("refresh grant issues a new access token", async () => {
+		await registerUser()
+		const first = (await (await login()).json()) as Record<string, any>
+
+		const form = new URLSearchParams({
+			grant_type: "refresh_token",
+			refresh_token: first.refresh_token,
+			client_id: "web"
+		})
+		const res = await SELF.fetch("https://vault.test/identity/connect/token", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: form.toString()
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as Record<string, any>
+		expect(body.access_token).toBeTruthy()
+		expect(body.refresh_token).toBe(first.refresh_token)
+		expect(body.scope).toBe("api offline_access")
+	})
+
+	it("rejects a bogus refresh token with invalid_grant", async () => {
+		const form = new URLSearchParams({
+			grant_type: "refresh_token",
+			refresh_token: "bogus",
+			client_id: "web"
+		})
+		const res = await SELF.fetch("https://vault.test/identity/connect/token", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: form.toString()
+		})
+		expect(res.status).toBe(400)
+		const body = (await res.json()) as Record<string, any>
+		expect(body.error).toBe("invalid_grant")
+	})
+
+	it("send-verification-email returns a raw token for iOS, JSON for other clients", async () => {
+		const jwtShape = /^[\w-]+\.[\w-]+\.[\w-]+$/
+
+		const iosRes = await SELF.fetch(
+			"https://vault.test/identity/accounts/register/send-verification-email",
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json", "Device-Type": "1" },
+				body: JSON.stringify({ email: TEST_USER.email, name: TEST_USER.name })
+			}
+		)
+		expect(iosRes.status).toBe(200)
+		const iosToken = await iosRes.text()
+		expect(iosToken).toMatch(jwtShape) // raw, no surrounding JSON quotes
+
+		const browserRes = await SELF.fetch(
+			"https://vault.test/identity/accounts/register/send-verification-email",
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json", "Device-Type": "2" },
+				body: JSON.stringify({ email: TEST_USER.email, name: TEST_USER.name })
+			}
+		)
+		expect(browserRes.status).toBe(200)
+		const browserToken = (await browserRes.json()) as string
+		expect(browserToken).toMatch(jwtShape)
+	})
+
+	it("register/finish accepts the legacy flat masterPasswordHash/key format", async () => {
+		const tokenRes = await SELF.fetch(
+			"https://vault.test/identity/accounts/register/send-verification-email",
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ email: TEST_USER.email, name: TEST_USER.name })
+			}
+		)
+		const emailVerificationToken = (await tokenRes.json()) as string
+
+		const res = await SELF.fetch("https://vault.test/identity/accounts/register/finish", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				email: TEST_USER.email,
+				masterPasswordHash: TEST_USER.masterPasswordHash,
+				key: TEST_USER.key,
+				kdf: TEST_USER.kdf,
+				kdfIterations: TEST_USER.kdfIterations,
+				keys: TEST_USER.keys,
+				emailVerificationToken
+			})
+		})
+		expect(res.status).toBe(200)
+
+		const loginRes = await login()
+		expect(loginRes.status).toBe(200)
+	})
+
+	it("register/finish accepts the wrapped masterPasswordAuthentication/masterPasswordUnlock format", async () => {
+		const tokenRes = await SELF.fetch(
+			"https://vault.test/identity/accounts/register/send-verification-email",
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ email: TEST_USER.email, name: TEST_USER.name })
+			}
+		)
+		const emailVerificationToken = (await tokenRes.json()) as string
+
+		const res = await SELF.fetch("https://vault.test/identity/accounts/register/finish", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				email: TEST_USER.email,
+				masterPasswordHint: null,
+				userAsymmetricKeys: TEST_USER.keys,
+				masterPasswordAuthentication: {
+					salt: TEST_USER.email,
+					kdf: { kdfType: TEST_USER.kdf, iterations: TEST_USER.kdfIterations },
+					masterPasswordAuthenticationHash: TEST_USER.masterPasswordHash
+				},
+				masterPasswordUnlock: {
+					salt: TEST_USER.email,
+					kdf: { kdfType: TEST_USER.kdf, iterations: TEST_USER.kdfIterations },
+					masterKeyWrappedUserKey: TEST_USER.key
+				},
+				emailVerificationToken
+			})
+		})
+		expect(res.status).toBe(200)
+
+		// The stored hash/key/kdf came from the wrapped shape, so login and prelogin
+		// (flat-format readers) must reflect the same values.
+		const pre = await SELF.fetch("https://vault.test/identity/accounts/prelogin", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ email: TEST_USER.email })
+		})
+		expect(((await pre.json()) as Record<string, unknown>).kdfIterations).toBe(
+			TEST_USER.kdfIterations
+		)
+
+		const loginRes = await login()
+		expect(loginRes.status).toBe(200)
+		const loginBody = (await loginRes.json()) as Record<string, any>
+		expect(loginBody.Key).toBe(TEST_USER.key)
+		expect(loginBody.PrivateKey).toBe(TEST_USER.keys.encryptedPrivateKey)
+	})
+})
